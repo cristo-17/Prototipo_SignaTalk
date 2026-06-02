@@ -1,0 +1,8 @@
+customtkinter
+psycopg2-binary
+opencv-python
+Pillow
+SpeechRecognition
+gTTS
+playsound3
+pyttsx3

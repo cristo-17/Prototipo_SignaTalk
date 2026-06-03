@@ -2,503 +2,631 @@ import threading
 import traceback
 import customtkinter as ctk
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image
 
 import voice_tools
-from psycopg2.extras import RealDictCursor
-
 from auth_db import (
-    get_connection,
     inicializar_bd,
-    crear_usuario,
     validar_login,
+    listar_usuarios,
     obtener_usuario,
-    actualizar_perfil,
-    obtener_configuracion,
-    guardar_configuracion,
-    listar_gestos_demo,
-    obtener_gesto_demo,
+    guardar_usuario,
+    listar_perfiles,
+    guardar_perfil,
+    obtener_velocidad_usuario,
+    listar_gestos,
+    guardar_gesto,
+    obtener_gesto_por_nombre,
     guardar_traduccion,
-    listar_historial,
-    eliminar_historial,
-    obtener_estadisticas_usuario,
+    listar_traducciones,
+    listar_frases,
+    guardar_frase,
 )
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
-def escala_tamano_texto(tamano: str) -> float:
-    """Convierte la preferencia de tamaño de texto en escala visual real."""
-    return {
-        "pequeño": 0.90,
-        "normal": 1.00,
-        "grande": 1.18,
-    }.get((tamano or "normal").lower(), 1.00)
+# =========================
+# HELPERS UI
+# =========================
+
+def es_admin(master) -> bool:
+    usuario = getattr(master, "usuario_actual", None) or {}
+    return (usuario.get("rol") or "usuario").strip().lower() == "admin"
+
+
+def etiqueta(parent, texto):
+    ctk.CTkLabel(parent, text=texto, anchor="w", font=("Segoe UI", 12, "bold")).pack(fill="x", padx=8, pady=(8, 2))
+
+
+def entrada(parent, placeholder="", show=None, width=260):
+    e = ctk.CTkEntry(parent, width=width, placeholder_text=placeholder, show=show)
+    e.pack(fill="x", padx=8, pady=(0, 6))
+    return e
+
+
+def option(parent, valores, valor_inicial=None, width=260, command=None):
+    var = ctk.StringVar(value=valor_inicial or valores[0])
+    opt = ctk.CTkOptionMenu(parent, values=valores, variable=var, width=width, command=command)
+    opt.pack(fill="x", padx=8, pady=(0, 6))
+    return var, opt
+
+
+def set_textbox(tb, texto):
+    tb.configure(state="normal")
+    tb.delete("1.0", "end")
+    tb.insert("1.0", texto or "")
+    tb.configure(state="disabled")
+
+
+def limpiar_entry(e):
+    e.delete(0, "end")
 
 
 class SignaTalkApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("SIGNATALK - Avance con PostgreSQL")
-        self.geometry("500x520")
-        self.minsize(460, 500)
+        self.title("SIGNATALK - 5 Formularios PostgreSQL")
+        self.geometry("1120x720")
+        self.minsize(1000, 640)
         self.usuario_actual = None
-        self.tamano_texto_actual = "normal"
-        self.velocidad_voz_actual = "normal"
         self.db_ok, self.db_msg = inicializar_bd()
         self.show_frame(LoginFrame)
 
     def show_frame(self, frame_class):
-        """Cambia de pantalla sin dejar la app congelada si una vista falla."""
         for widget in self.winfo_children():
             widget.destroy()
         try:
             frame = frame_class(self)
         except Exception as e:
             traceback.print_exc()
-            frame = ErrorFrame(self, f"No se pudo abrir la pantalla: {frame_class.__name__}", repr(e))
+            frame = ErrorFrame(self, "No se pudo abrir la pantalla", repr(e))
         frame.pack(fill="both", expand=True)
 
-    def aplicar_preferencias_visuales(self, tema="dark", tamano_texto="normal"):
-        """Aplica cambios reales de tema y escala de interfaz."""
-        ctk.set_appearance_mode("light" if tema == "light" else "dark")
-        ctk.set_widget_scaling(escala_tamano_texto(tamano_texto))
-        self.tamano_texto_actual = tamano_texto or "normal"
-
     def iniciar_sesion(self, usuario_data):
-        """Guarda la sesion activa y abre el menu principal.
-        Si algo falla al cargar preferencias o estadísticas, no deja el login congelado.
-        """
-        try:
-            if not usuario_data or "id" not in usuario_data:
-                self.usuario_actual = None
-                self.geometry("500x520")
-                self.show_frame(LoginFrame)
-                return
-
-            self.usuario_actual = dict(usuario_data)
-            self.velocidad_voz_actual = "normal"
-
-            try:
-                ok, _, config = obtener_configuracion(usuario_data["id"])
-                if ok and config:
-                    tema = config.get("tema") or "dark"
-                    tamano_texto = config.get("tamano_texto") or "normal"
-                    self.velocidad_voz_actual = config.get("velocidad_voz") or "normal"
-                    self.aplicar_preferencias_visuales(tema, tamano_texto)
-                else:
-                    self.aplicar_preferencias_visuales("dark", "normal")
-            except Exception as e:
-                print("Error cargando configuracion del usuario:", e)
-                traceback.print_exc()
-                self.aplicar_preferencias_visuales("dark", "normal")
-
-            self.geometry("1000x660")
-            self.show_frame(MenuFrame)
-        except Exception as e:
-            traceback.print_exc()
-            self.geometry("500x520")
-            self.show_frame(LoginFrame)
+        self.usuario_actual = dict(usuario_data)
+        self.show_frame(MenuFrame)
 
     def cerrar_sesion(self):
-        """Cierra sesion desde cualquier pantalla y vuelve al login limpio."""
-        try:
-            self.usuario_actual = None
-            self.tamano_texto_actual = "normal"
-            self.velocidad_voz_actual = "normal"
-            ctk.set_appearance_mode("dark")
-            ctk.set_widget_scaling(1.0)
-            self.geometry("500x520")
-            self.after(20, lambda: self.show_frame(LoginFrame))
-        except Exception:
-            traceback.print_exc()
-            self.usuario_actual = None
-            self.show_frame(LoginFrame)
+        self.usuario_actual = None
+        self.show_frame(LoginFrame)
 
 
 class BaseFrame(ctk.CTkFrame):
-    def titulo(self, texto, subtitulo=""):
-        ctk.CTkLabel(self, text=texto, font=("Segoe UI", 24, "bold")).pack(pady=(18, 4))
+    def titulo(self, titulo, subtitulo=""):
+        ctk.CTkLabel(self, text=titulo, font=("Segoe UI", 26, "bold")).pack(pady=(14, 4))
         if subtitulo:
-            ctk.CTkLabel(self, text=subtitulo, font=("Segoe UI", 13), wraplength=780).pack(pady=(0, 12))
+            ctk.CTkLabel(self, text=subtitulo, font=("Segoe UI", 13), wraplength=900).pack(pady=(0, 10))
 
-    def nav_button(self, texto, frame_class, width=180):
-        return ctk.CTkButton(self, text=texto, width=width, command=lambda: self.master.show_frame(frame_class))
+    def nav_bottom(self):
+        nav = ctk.CTkFrame(self)
+        nav.pack(side="bottom", fill="x", padx=18, pady=12)
+        ctk.CTkButton(nav, text="Volver al menu principal", command=lambda: self.master.show_frame(MenuFrame), width=190).pack(side="left", padx=8, pady=8)
+        ctk.CTkButton(nav, text="Cerrar sesion", command=self.master.cerrar_sesion, width=160).pack(side="left", padx=8, pady=8)
+        ctk.CTkButton(nav, text="Salir", command=self.master.quit, fg_color="#d90429", width=120).pack(side="right", padx=8, pady=8)
+        return nav
 
-    def velocidad_voz_configurada(self):
-        id_usuario = self.master.usuario_actual.get("id") if self.master.usuario_actual else None
-        if not id_usuario:
-            return "normal"
-        ok, _, config = obtener_configuracion(id_usuario)
-        if ok and config:
-            return config.get("velocidad_voz", "normal")
-        return getattr(self.master, "velocidad_voz_actual", "normal")
-
-
-
-
-def rol_actual(master) -> str:
-    usuario = getattr(master, "usuario_actual", None) or {}
-    return (usuario.get("rol") or "usuario").strip().lower()
-
-
-def es_admin(master) -> bool:
-    return rol_actual(master) in ("admin", "administrador")
-
-
-def admin_listar_usuarios():
-    try:
-        with get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT id, usuario, nombre_completo, rol, activo, creado_en, ultimo_login
-                    FROM usuarios
-                    ORDER BY id ASC
-                    """
-                )
-                filas = cur.fetchall()
-        return True, "Usuarios obtenidos.", [dict(f) for f in filas]
-    except Exception as e:
-        return False, "Error al listar usuarios: " + repr(e), []
-
-
-def admin_cambiar_rol(id_usuario: int, nuevo_rol: str):
-    nuevo_rol = (nuevo_rol or "usuario").strip().lower()
-    if nuevo_rol not in ("usuario", "admin"):
-        return False, "Rol no válido."
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE usuarios SET rol = %s WHERE id = %s", (nuevo_rol, id_usuario))
-        return True, "Rol actualizado correctamente."
-    except Exception as e:
-        return False, "Error al actualizar rol: " + repr(e)
-
-
-def admin_cambiar_estado_usuario(id_usuario: int, activo: bool):
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE usuarios SET activo = %s WHERE id = %s", (activo, id_usuario))
-        return True, "Estado del usuario actualizado."
-    except Exception as e:
-        return False, "Error al cambiar estado: " + repr(e)
-
-
-def admin_guardar_gesto(nombre_gesto: str, texto_traducido: str, categoria: str, descripcion: str):
-    nombre_gesto = (nombre_gesto or "").strip().upper()
-    texto_traducido = (texto_traducido or "").strip()
-    categoria = (categoria or "General").strip()
-    descripcion = (descripcion or "").strip()
-
-    if not nombre_gesto or not texto_traducido:
-        return False, "Nombre del gesto y texto traducido son obligatorios."
-
-    try:
-        with get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id FROM gestos_demo WHERE nombre_gesto = %s LIMIT 1", (nombre_gesto,))
-                fila = cur.fetchone()
-                if fila:
-                    cur.execute(
-                        """
-                        UPDATE gestos_demo
-                        SET texto_traducido = %s,
-                            categoria = %s,
-                            descripcion = %s,
-                            activo = TRUE
-                        WHERE id = %s
-                        """,
-                        (texto_traducido, categoria, descripcion, fila["id"]),
-                    )
-                    return True, "Gesto actualizado correctamente."
-                cur.execute(
-                    """
-                    INSERT INTO gestos_demo (nombre_gesto, texto_traducido, categoria, descripcion, activo)
-                    VALUES (%s, %s, %s, %s, TRUE)
-                    """,
-                    (nombre_gesto, texto_traducido, categoria, descripcion),
-                )
-        return True, "Gesto registrado correctamente."
-    except Exception as e:
-        return False, "Error al guardar gesto: " + repr(e)
-
-
-def admin_cambiar_estado_gesto(id_gesto: int, activo: bool):
-    try:
-        with get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE gestos_demo SET activo = %s WHERE id = %s", (activo, id_gesto))
-        return True, "Estado del gesto actualizado."
-    except Exception as e:
-        return False, "Error al cambiar estado del gesto: " + repr(e)
-
-
-def admin_listar_gestos_todos():
-    try:
-        with get_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    SELECT id, nombre_gesto, texto_traducido, categoria, descripcion, activo, creado_en
-                    FROM gestos_demo
-                    ORDER BY nombre_gesto ASC
-                    """
-                )
-                filas = cur.fetchall()
-        return True, "Gestos obtenidos.", [dict(f) for f in filas]
-    except Exception as e:
-        return False, "Error al listar gestos: " + repr(e), []
+    def usuario_id_para_form(self, combo_var=None, mapa=None):
+        if not es_admin(self.master):
+            return self.master.usuario_actual["id"]
+        if combo_var and mapa:
+            return mapa.get(combo_var.get())
+        return self.master.usuario_actual["id"]
 
 
 class ErrorFrame(BaseFrame):
     def __init__(self, master, titulo_error="Error", detalle=""):
         super().__init__(master)
         self.titulo("SIGNATALK", titulo_error)
-        ctk.CTkLabel(
-            self,
-            text=detalle or "Ocurrio un error inesperado.",
-            text_color="#ff9f1c",
-            wraplength=760,
-            justify="center",
-        ).pack(pady=18, padx=24)
-        ctk.CTkLabel(
-            self,
-            text="Revisa la terminal de VS Code para ver el detalle técnico del error.",
-            wraplength=760,
-        ).pack(pady=8)
-        ctk.CTkButton(self, text="Volver al login", command=lambda: master.show_frame(LoginFrame), width=190).pack(pady=12)
-        if master.usuario_actual:
-            ctk.CTkButton(self, text="Intentar abrir menú", command=lambda: master.show_frame(MenuFrame), width=190).pack(pady=8)
+        ctk.CTkLabel(self, text=detalle, text_color="#ff9f1c", wraplength=900).pack(pady=18, padx=20)
+        ctk.CTkButton(self, text="Volver al login", command=lambda: master.show_frame(LoginFrame), width=180).pack(pady=12)
 
 
+# =========================
+# LOGIN Y MENU
+# =========================
 class LoginFrame(BaseFrame):
     def __init__(self, master):
         super().__init__(master)
-        self.titulo("SIGNATALK", "Inicio de sesión conectado a PostgreSQL")
-
+        self.titulo("SIGNATALK", "Login conectado a PostgreSQL")
         if not master.db_ok:
-            ctk.CTkLabel(self, text=master.db_msg, text_color="#ff9f1c", wraplength=420).pack(pady=8)
+            ctk.CTkLabel(self, text=master.db_msg, text_color="#ff9f1c", wraplength=900).pack(pady=8)
 
         card = ctk.CTkFrame(self)
-        card.pack(pady=12, padx=40, fill="x")
+        card.pack(pady=18, padx=50)
 
-        self.usuario_entry = ctk.CTkEntry(card, width=320, placeholder_text="Usuario")
-        self.usuario_entry.pack(pady=(24, 10))
+        etiqueta(card, "Tipo de acceso:")
+        self.rol_var, _ = option(card, ["usuario", "admin"], "usuario", width=340)
 
-        self.password_entry = ctk.CTkEntry(card, width=320, placeholder_text="Contraseña", show="*")
-        self.password_entry.pack(pady=10)
+        etiqueta(card, "Usuario:")
+        self.usuario_entry = entrada(card, "Ingrese su usuario", width=340)
 
-        self.mensaje_label = ctk.CTkLabel(card, text="", width=360, wraplength=360)
-        self.mensaje_label.pack(pady=10)
+        etiqueta(card, "Contrasena:")
+        self.password_entry = entrada(card, "Ingrese su contrasena", show="*", width=340)
 
-        self.login_button = ctk.CTkButton(card, text="Ingresar", command=self.validar, width=190)
+        self.mensaje_label = ctk.CTkLabel(card, text="", wraplength=360)
+        self.mensaje_label.pack(pady=8)
+
+        self.login_button = ctk.CTkButton(card, text="Ingresar", command=self.validar, width=180)
         self.login_button.pack(pady=8)
-
-        ctk.CTkButton(card, text="Crear nueva cuenta", command=lambda: master.show_frame(RegistroFrame), width=190).pack(pady=8)
-        ctk.CTkButton(card, text="Salir", command=master.quit, fg_color="#d90429", width=190).pack(pady=(8, 24))
-
-        self.usuario_entry.bind("<Return>", lambda event: self.validar())
-        self.password_entry.bind("<Return>", lambda event: self.validar())
-        self.usuario_entry.focus()
+        ctk.CTkButton(card, text="Salir", command=master.quit, fg_color="#d90429", width=180).pack(pady=(4, 18))
 
     def validar(self):
         usuario = self.usuario_entry.get()
         password = self.password_entry.get()
+        rol = self.rol_var.get()
         self.login_button.configure(state="disabled", text="Validando...")
         self.mensaje_label.configure(text="Consultando PostgreSQL...")
 
         def run():
-            ok, mensaje, usuario_data = validar_login(usuario, password)
-            self.after(0, lambda: self.procesar_resultado(ok, mensaje, usuario_data))
+            ok, msg, data = validar_login(usuario, password, rol)
+            self.after(0, lambda: self.procesar(ok, msg, data))
 
         threading.Thread(target=run, daemon=True).start()
 
-    def procesar_resultado(self, ok, mensaje, usuario_data):
+    def procesar(self, ok, msg, data):
         if ok:
-            self.mensaje_label.configure(text="Acceso correcto. Abriendo menu principal...")
-            self.login_button.configure(state="disabled", text="Ingresando...")
-            # Se programa la navegacion y se protege con try/except para que el
-            # botón no se quede en "Ingresando..." si falla la carga del menú.
-            def abrir_menu_seguro():
-                try:
-                    self.master.iniciar_sesion(usuario_data)
-                except Exception as e:
-                    traceback.print_exc()
-                    self.login_button.configure(state="normal", text="Ingresar")
-                    self.mensaje_label.configure(text="Acceso correcto, pero no se pudo abrir el menú. Revisa la terminal. Detalle: " + repr(e))
-
-            self.after(150, abrir_menu_seguro)
+            self.mensaje_label.configure(text="Acceso correcto. Abriendo menu...")
+            self.after(250, lambda: self.master.iniciar_sesion(data))
         else:
             self.login_button.configure(state="normal", text="Ingresar")
-            self.mensaje_label.configure(text=mensaje)
+            self.mensaje_label.configure(text=msg)
             self.password_entry.delete(0, "end")
-
-
-class RegistroFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        self.titulo("Registro de usuario", "Formulario conectado a la tabla usuarios")
-
-        card = ctk.CTkFrame(self)
-        card.pack(pady=10, padx=40, fill="x")
-
-        self.usuario_entry = ctk.CTkEntry(card, width=340, placeholder_text="Usuario")
-        self.usuario_entry.pack(pady=(22, 8))
-        self.nombre_entry = ctk.CTkEntry(card, width=340, placeholder_text="Nombre completo")
-        self.nombre_entry.pack(pady=8)
-
-        ctk.CTkLabel(
-            card,
-            text="Rol asignado: usuario\nLos roles administrativos se asignan únicamente desde el Panel Administrador.",
-            text_color="#9aa4ad",
-            wraplength=340,
-            justify="center",
-        ).pack(pady=8)
-
-        self.password_entry = ctk.CTkEntry(card, width=340, placeholder_text="Contraseña", show="*")
-        self.password_entry.pack(pady=8)
-        self.repetir_entry = ctk.CTkEntry(card, width=340, placeholder_text="Confirmar contraseña", show="*")
-        self.repetir_entry.pack(pady=8)
-
-        self.mensaje_label = ctk.CTkLabel(card, text="", width=380, wraplength=380)
-        self.mensaje_label.pack(pady=10)
-
-        self.registrar_btn = ctk.CTkButton(card, text="Registrar", command=self.registrar, width=190)
-        self.registrar_btn.pack(pady=8)
-        ctk.CTkButton(card, text="Volver al login", command=lambda: master.show_frame(LoginFrame), width=190).pack(pady=8)
-        ctk.CTkButton(card, text="Salir", command=master.quit, fg_color="#d90429", width=190).pack(pady=(8, 22))
-
-    def registrar(self):
-        usuario = self.usuario_entry.get()
-        nombre = self.nombre_entry.get()
-        rol = "usuario"
-        password = self.password_entry.get()
-        repetir = self.repetir_entry.get()
-
-        if password != repetir:
-            self.mensaje_label.configure(text="Las contraseñas no coinciden.")
-            return
-
-        self.registrar_btn.configure(state="disabled", text="Registrando...")
-        ok, mensaje = crear_usuario(usuario, password, nombre, rol)
-        self.mensaje_label.configure(text=mensaje)
-        if ok:
-            self.password_entry.delete(0, "end")
-            self.repetir_entry.delete(0, "end")
-            self.mensaje_label.configure(text=mensaje + " Ahora inicia sesión con ese usuario.")
-            self.after(900, lambda: self.master.show_frame(LoginFrame))
-        else:
-            self.registrar_btn.configure(state="normal", text="Registrar")
 
 
 class MenuFrame(BaseFrame):
     def __init__(self, master):
         super().__init__(master)
         usuario = master.usuario_actual or {}
-        nombre = usuario.get("nombre_completo") or usuario.get("usuario") or "Usuario"
-        rol = rol_actual(master)
-        self.titulo("SIGNATALK", f"Sesión activa: {nombre} | Rol: {rol}")
+        nombre = usuario.get("nombre_completo") or usuario.get("usuario")
+        rol = usuario.get("rol") or "usuario"
+        self.titulo("SIGNATALK", f"Sesion activa: {nombre} | Rol: {rol}")
 
-        ok, _, stats = obtener_estadisticas_usuario(usuario.get("id"))
-        resumen = f"Traducciones guardadas: {stats.get('total', 0)}" if ok else "Resumen no disponible"
-        ctk.CTkLabel(self, text=resumen, font=("Segoe UI", 13)).pack(pady=(0, 6))
+        # Barra inferior fija. Se crea antes del contenido para que siempre sea visible,
+        # incluso cuando el administrador tenga mas opciones en pantalla.
+        nav = ctk.CTkFrame(self)
+        nav.pack(side="bottom", fill="x", padx=18, pady=(6, 12))
+        ctk.CTkButton(
+            nav,
+            text="Cerrar sesion",
+            command=master.cerrar_sesion,
+            width=170,
+        ).pack(side="left", padx=8, pady=8)
+        ctk.CTkButton(
+            nav,
+            text="Salir",
+            command=master.quit,
+            fg_color="#d90429",
+            width=130,
+        ).pack(side="right", padx=8, pady=8)
 
+        cont = ctk.CTkScrollableFrame(self, width=1020, height=560)
+        cont.pack(fill="both", expand=True, padx=24, pady=(8, 4))
+
+        forms = []
         if es_admin(master):
+            forms.append(("Formulario 1: Usuarios", "Crear y modificar usuarios. Rol visible por cuenta.", UsuariosFrame))
+        forms.extend([
+            ("Formulario 2: Perfiles", "DNI, correo, telefono, direccion y velocidad de voz.", PerfilesFrame),
+            ("Formulario 3: Gestos demo", "Gestos predeterminados y propios por usuario.", GestosFrame),
+            ("Formulario 4: Traducciones", "Camara, texto a voz y voz a texto.", TraduccionesFrame),
+            ("Formulario 5: Frases frecuentes", "Frases utiles propias de cada usuario.", FrasesFrame),
+        ])
+
+        for titulo, desc, frame_class in forms:
+            card = ctk.CTkFrame(cont)
+            card.pack(fill="x", padx=16, pady=7)
             ctk.CTkLabel(
-                self,
-                text="Modo administrador activo: puedes gestionar usuarios y gestos demo del sistema.",
-                text_color="#00b894",
-                font=("Segoe UI", 13, "bold"),
-            ).pack(pady=(0, 10))
-        else:
+                card,
+                text=titulo,
+                font=("Segoe UI", 16, "bold"),
+                anchor="w",
+            ).pack(fill="x", padx=14, pady=(10, 3))
             ctk.CTkLabel(
-                self,
-                text="Modo usuario: puedes usar traducción, voz, historial y tu perfil. No tienes permisos administrativos.",
-                text_color="#9aa4ad",
-                font=("Segoe UI", 12),
-                wraplength=760,
+                card,
+                text=desc,
+                anchor="w",
+                wraplength=850,
+            ).pack(fill="x", padx=14, pady=(0, 6))
+            ctk.CTkButton(
+                card,
+                text="Abrir",
+                command=lambda f=frame_class: master.show_frame(f),
+                width=140,
             ).pack(pady=(0, 10))
 
-        grid = ctk.CTkFrame(self)
-        grid.pack(padx=28, pady=10, fill="both", expand=True)
-        grid.grid_columnconfigure((0, 1, 2), weight=1)
-        grid.grid_rowconfigure((0, 1), weight=1)
 
-        items = [
-            ("1. Traducción / Cámara", "Simula LSP → texto/voz y guarda el resultado", TraduccionFrame),
-            ("2. Historial", "Consulta y reproduce traducciones guardadas", HistorialFrame),
-            ("3. Configuración / Perfil", "Actualiza preferencias y datos del usuario", ConfiguracionFrame),
-            ("4. Texto a Voz", "Convierte texto escrito en audio", TextoAVozFrame),
-            ("5. Voz a Texto", "Convierte voz del micrófono en texto", VozATextoFrame),
-        ]
-        if es_admin(master):
-            items.append(("6. Panel Administrador", "Gestiona usuarios, roles y gestos demo", AdminPanelFrame))
+# =========================
+# FORMULARIO 1 USUARIOS
+# =========================
+class UsuariosFrame(BaseFrame):
+    def __init__(self, master):
+        super().__init__(master)
+        if not es_admin(master):
+            self.titulo("Acceso restringido", "Solo el administrador puede usar el Formulario 1.")
+            self.nav_bottom()
+            return
 
-        for i, (titulo, desc, frame) in enumerate(items):
-            card = ctk.CTkFrame(grid)
-            card.grid(row=i // 3, column=i % 3, padx=10, pady=10, sticky="nsew")
-            ctk.CTkLabel(card, text=titulo, font=("Segoe UI", 15, "bold")).pack(pady=(16, 6))
-            ctk.CTkLabel(card, text=desc, wraplength=260).pack(pady=6, padx=14)
-            ctk.CTkButton(card, text="Abrir", command=lambda f=frame: master.show_frame(f), width=140).pack(pady=(10, 16))
+        self.id_editando = None
+        self.titulo("Formulario 1: Usuarios", "Crear y modificar usuarios. La lista se refleja en el Formulario 2.")
+        self.nav_bottom()
 
-        bottom = ctk.CTkFrame(self)
-        bottom.pack(pady=(0, 18))
-        ctk.CTkButton(bottom, text="Cerrar sesión", command=master.cerrar_sesion, width=180).pack(side="left", padx=8)
-        ctk.CTkButton(bottom, text="Salir", command=master.quit, fg_color="#d90429", width=180).pack(side="left", padx=8)
+        body = ctk.CTkFrame(self)
+        body.pack(fill="both", expand=True, padx=18, pady=8)
+
+        form = ctk.CTkFrame(body)
+        form.pack(side="left", fill="y", padx=(0, 12), pady=6)
+
+        etiqueta(form, "Usuario:")
+        self.usuario_entry = entrada(form, "Ejemplo: usuario5", width=300)
+        etiqueta(form, "Nombre completo:")
+        self.nombre_entry = entrada(form, "Nombre completo", width=300)
+        etiqueta(form, "Rol:")
+        self.rol_var, _ = option(form, ["usuario", "admin"], "usuario", width=300)
+        etiqueta(form, "Contrasena:")
+        self.password_entry = entrada(form, "Obligatoria al crear", show="*", width=300)
+        etiqueta(form, "Confirmar contrasena:")
+        self.confirmar_entry = entrada(form, "Repetir contrasena", show="*", width=300)
+
+        self.mensaje = ctk.CTkLabel(form, text="", wraplength=300)
+        self.mensaje.pack(pady=6)
+        ctk.CTkButton(form, text="Guardar usuario", command=self.guardar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Limpiar campos", command=self.limpiar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Volver al menu principal", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=4)
+
+        self.scroll = ctk.CTkScrollableFrame(body, width=690)
+        self.scroll.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=6)
+        self.cargar()
+
+    def limpiar(self):
+        self.id_editando = None
+        for e in [self.usuario_entry, self.nombre_entry, self.password_entry, self.confirmar_entry]:
+            limpiar_entry(e)
+        self.rol_var.set("usuario")
+        self.mensaje.configure(text="Campos limpios. Puedes crear un nuevo usuario.")
+
+    def guardar(self):
+        ok, msg = guardar_usuario(
+            self.id_editando,
+            self.usuario_entry.get(),
+            self.nombre_entry.get(),
+            self.rol_var.get(),
+            self.password_entry.get(),
+            self.confirmar_entry.get(),
+        )
+        self.mensaje.configure(text=msg)
+        if ok:
+            self.limpiar()
+            self.cargar()
+
+    def cargar(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        ok, msg, usuarios = listar_usuarios(True, self.master.usuario_actual["id"])
+        if not ok:
+            ctk.CTkLabel(self.scroll, text=msg).pack(pady=8)
+            return
+        for u in usuarios:
+            card = ctk.CTkFrame(self.scroll)
+            card.pack(fill="x", padx=8, pady=6)
+            texto = f"ID {u['id']} | Usuario: {u['usuario']} | Nombre: {u['nombre_completo']} | Rol: {u['rol']}"
+            ctk.CTkLabel(card, text=texto, anchor="w", font=("Segoe UI", 13, "bold"), wraplength=630).pack(fill="x", padx=10, pady=(8, 4))
+            ctk.CTkButton(card, text="Cargar para modificar", command=lambda uu=u: self.cargar_form(uu), width=170).pack(padx=10, pady=(0, 8))
+
+    def cargar_form(self, u):
+        self.id_editando = u["id"]
+        self.usuario_entry.delete(0, "end")
+        self.usuario_entry.insert(0, u["usuario"])
+        self.nombre_entry.delete(0, "end")
+        self.nombre_entry.insert(0, u["nombre_completo"] or "")
+        self.rol_var.set(u["rol"] or "usuario")
+        self.password_entry.delete(0, "end")
+        self.confirmar_entry.delete(0, "end")
+        self.mensaje.configure(text="Usuario cargado. Modifica los campos y guarda. La contrasena es opcional al editar.")
 
 
-class TraduccionFrame(BaseFrame):
+# =========================
+# FORMULARIO 2 PERFILES
+# =========================
+class PerfilesFrame(BaseFrame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.id_usuario_seleccionado = master.usuario_actual["id"]
+        self.titulo("Formulario 2: Perfiles de usuario", "Cada usuario tiene su propio perfil. El admin puede ver quien creo cada registro.")
+        self.nav_bottom()
+
+        body = ctk.CTkFrame(self)
+        body.pack(fill="both", expand=True, padx=18, pady=8)
+
+        form = ctk.CTkFrame(body)
+        form.pack(side="left", fill="y", padx=(0, 12), pady=6)
+
+        ok, _, usuarios = listar_usuarios(es_admin(master), master.usuario_actual["id"])
+        self.usuario_map = {f"{u['usuario']} - {u['nombre_completo']}": u["id"] for u in usuarios}
+        if not self.usuario_map:
+            self.usuario_map = {master.usuario_actual["usuario"]: master.usuario_actual["id"]}
+
+        etiqueta(form, "Usuario del perfil:")
+        self.usuario_var, _ = option(form, list(self.usuario_map.keys()), list(self.usuario_map.keys())[0], width=320)
+        etiqueta(form, "DNI:")
+        self.dni_entry = entrada(form, "8 digitos", width=320)
+        etiqueta(form, "Correo:")
+        self.correo_entry = entrada(form, "correo@dominio.com", width=320)
+        etiqueta(form, "Telefono:")
+        self.telefono_entry = entrada(form, "9 digitos", width=320)
+        etiqueta(form, "Direccion:")
+        self.direccion_entry = entrada(form, "Direccion del usuario", width=320)
+        etiqueta(form, "Velocidad de voz:")
+        self.velocidad_var, _ = option(form, ["lenta", "normal", "rapida"], "normal", width=320)
+
+        self.mensaje = ctk.CTkLabel(form, text="", wraplength=320)
+        self.mensaje.pack(pady=6)
+        ctk.CTkButton(form, text="Guardar perfil", command=self.guardar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Limpiar campos", command=self.limpiar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Volver al menu principal", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=4)
+
+        self.scroll = ctk.CTkScrollableFrame(body, width=690)
+        self.scroll.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=6)
+        self.cargar()
+
+    def limpiar(self):
+        for e in [self.dni_entry, self.correo_entry, self.telefono_entry, self.direccion_entry]:
+            limpiar_entry(e)
+        self.velocidad_var.set("normal")
+        self.mensaje.configure(text="Campos limpios.")
+
+    def guardar(self):
+        id_usuario = self.usuario_map.get(self.usuario_var.get(), self.master.usuario_actual["id"])
+        if not es_admin(self.master) and id_usuario != self.master.usuario_actual["id"]:
+            self.mensaje.configure(text="No puedes modificar perfiles de otros usuarios.")
+            return
+        ok, msg = guardar_perfil(
+            id_usuario,
+            self.dni_entry.get(),
+            self.correo_entry.get(),
+            self.telefono_entry.get(),
+            self.direccion_entry.get(),
+            self.velocidad_var.get(),
+        )
+        self.mensaje.configure(text=msg)
+        if ok:
+            self.cargar()
+
+    def cargar(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        ok, msg, perfiles = listar_perfiles(es_admin(self.master), self.master.usuario_actual["id"])
+        if not ok:
+            ctk.CTkLabel(self.scroll, text=msg).pack(pady=8)
+            return
+        for p in perfiles:
+            card = ctk.CTkFrame(self.scroll)
+            card.pack(fill="x", padx=8, pady=6)
+            base = f"Usuario: {p['usuario']} | Nombre: {p['nombre_completo']} | Rol: {p['rol']}"
+            ctk.CTkLabel(card, text=base, anchor="w", font=("Segoe UI", 13, "bold"), wraplength=640).pack(fill="x", padx=10, pady=(8, 4))
+            detalle = f"DNI: {p.get('dni') or 'Sin perfil'} | Telefono: {p.get('telefono') or '-'} | Correo: {p.get('correo') or '-'}\nDireccion: {p.get('direccion') or '-'} | Velocidad: {p.get('velocidad_voz') or '-'}"
+            ctk.CTkLabel(card, text=detalle, anchor="w", wraplength=640, justify="left").pack(fill="x", padx=10, pady=4)
+            ctk.CTkButton(card, text="Cargar perfil", command=lambda pp=p: self.cargar_form(pp), width=150).pack(padx=10, pady=(0, 8))
+
+    def cargar_form(self, p):
+        self.id_usuario_seleccionado = p["id_usuario"]
+        for label, uid in self.usuario_map.items():
+            if uid == p["id_usuario"]:
+                self.usuario_var.set(label)
+                break
+        self.limpiar()
+        if p.get("dni"):
+            self.dni_entry.insert(0, p.get("dni") or "")
+            self.correo_entry.insert(0, p.get("correo") or "")
+            self.telefono_entry.insert(0, p.get("telefono") or "")
+            self.direccion_entry.insert(0, p.get("direccion") or "")
+            self.velocidad_var.set(p.get("velocidad_voz") or "normal")
+        self.mensaje.configure(text="Perfil cargado para modificar.")
+
+
+# =========================
+# FORMULARIO 3 GESTOS
+# =========================
+class GestosFrame(BaseFrame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.id_editando = None
+        self.titulo("Formulario 3: Gestos demo", "Los gestos pertenecen a cada usuario. Editar uno no afecta a los demas usuarios.")
+        self.nav_bottom()
+
+        body = ctk.CTkFrame(self)
+        body.pack(fill="both", expand=True, padx=18, pady=8)
+        form = ctk.CTkFrame(body)
+        form.pack(side="left", fill="y", padx=(0, 12), pady=6)
+
+        ok, _, usuarios = listar_usuarios(es_admin(master), master.usuario_actual["id"])
+        self.usuario_map = {f"{u['usuario']} - {u['nombre_completo']}": u["id"] for u in usuarios}
+        if not self.usuario_map:
+            self.usuario_map = {master.usuario_actual["usuario"]: master.usuario_actual["id"]}
+
+        etiqueta(form, "Usuario propietario:")
+        self.usuario_var, self.usuario_combo = option(
+            form,
+            list(self.usuario_map.keys()),
+            list(self.usuario_map.keys())[0],
+            width=320,
+            command=lambda _: self.cambiar_usuario_propietario(),
+        )
+        etiqueta(form, "Nombre del gesto:")
+        self.nombre_entry = entrada(form, "Ejemplo: HOLA", width=320)
+        etiqueta(form, "Texto traducido:")
+        self.texto_entry = entrada(form, "Texto resultado", width=320)
+        etiqueta(form, "Categoria:")
+        self.categoria_entry = entrada(form, "Saludo, Salud, Emergencia...", width=320)
+        etiqueta(form, "Descripcion:")
+        self.descripcion_entry = entrada(form, "Descripcion breve", width=320)
+
+        self.mensaje = ctk.CTkLabel(form, text="", wraplength=320)
+        self.mensaje.pack(pady=6)
+        ctk.CTkButton(form, text="Guardar gesto", command=self.guardar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Limpiar campos", command=self.limpiar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Volver al menu principal", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=4)
+
+        self.scroll = ctk.CTkScrollableFrame(body, width=690)
+        self.scroll.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=6)
+        self.cargar()
+
+    def limpiar(self):
+        self.id_editando = None
+        for e in [self.nombre_entry, self.texto_entry, self.categoria_entry, self.descripcion_entry]:
+            limpiar_entry(e)
+        self.mensaje.configure(text="Campos limpios.")
+
+    def cambiar_usuario_propietario(self):
+        self.id_editando = None
+        for e in [self.nombre_entry, self.texto_entry, self.categoria_entry, self.descripcion_entry]:
+            limpiar_entry(e)
+        self.mensaje.configure(text="Mostrando solo los gestos del usuario propietario seleccionado.")
+        self.cargar()
+
+    def guardar(self):
+        id_usuario = self.usuario_map.get(self.usuario_var.get(), self.master.usuario_actual["id"])
+        if not es_admin(self.master) and id_usuario != self.master.usuario_actual["id"]:
+            self.mensaje.configure(text="No puedes crear gestos para otros usuarios.")
+            return
+        ok, msg = guardar_gesto(
+            self.id_editando,
+            id_usuario,
+            self.nombre_entry.get(),
+            self.texto_entry.get(),
+            self.categoria_entry.get(),
+            self.descripcion_entry.get(),
+        )
+        self.mensaje.configure(text=msg)
+        if ok:
+            self.limpiar()
+            self.cargar()
+
+    def cargar(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        ok, msg, gestos = listar_gestos(es_admin(self.master), self.master.usuario_actual["id"])
+        if not ok:
+            ctk.CTkLabel(self.scroll, text=msg).pack(pady=8)
+            return
+        id_filtrado = self.usuario_map.get(self.usuario_var.get(), self.master.usuario_actual["id"])
+        gestos = [g for g in gestos if g.get("id_usuario") == id_filtrado]
+        if not gestos:
+            ctk.CTkLabel(self.scroll, text="No hay gestos registrados para el usuario seleccionado.").pack(pady=8)
+            return
+        for g in gestos:
+            card = ctk.CTkFrame(self.scroll)
+            card.pack(fill="x", padx=8, pady=6)
+            header = f"Usuario: {g['usuario']} | Gesto: {g['nombre_gesto']} | Categoria: {g['categoria']}"
+            ctk.CTkLabel(card, text=header, anchor="w", font=("Segoe UI", 13, "bold"), wraplength=640).pack(fill="x", padx=10, pady=(8, 4))
+            ctk.CTkLabel(card, text=f"Texto: {g['texto_traducido']}\nDescripcion: {g.get('descripcion') or ''}", anchor="w", wraplength=640, justify="left").pack(fill="x", padx=10, pady=4)
+            ctk.CTkButton(card, text="Cargar para modificar", command=lambda gg=g: self.cargar_form(gg), width=170).pack(padx=10, pady=(0, 8))
+
+    def cargar_form(self, g):
+        self.id_editando = g["id"]
+        for label, uid in self.usuario_map.items():
+            if uid == g["id_usuario"]:
+                self.usuario_var.set(label)
+                break
+        self.nombre_entry.delete(0, "end")
+        self.nombre_entry.insert(0, g["nombre_gesto"])
+        self.texto_entry.delete(0, "end")
+        self.texto_entry.insert(0, g["texto_traducido"])
+        self.categoria_entry.delete(0, "end")
+        self.categoria_entry.insert(0, g["categoria"])
+        self.descripcion_entry.delete(0, "end")
+        self.descripcion_entry.insert(0, g.get("descripcion") or "")
+        self.mensaje.configure(text="Gesto cargado. La modificacion solo afectara al usuario propietario de este registro.")
+
+
+# =========================
+# FORMULARIO 4 TRADUCCIONES
+# =========================
+class TraduccionesFrame(BaseFrame):
     def __init__(self, master):
         super().__init__(master)
         self.cap = None
         self.camera_running = False
-        self.current_tipo = "LSP a texto (demo)"
-        self.current_original = ""
         self.current_traducido = ""
+        self.current_original = ""
+        self.current_tipo = ""
+        self.titulo("Formulario 4: Traducciones", "Camara/LSP demo, Texto a Voz y Voz a Texto. El historial es propio de cada usuario.")
+        self.nav_bottom()
 
-        self.titulo("Pantalla de Traducción", "Cámara base + reconocimiento simulado desde tabla gestos_demo")
+        self.body = ctk.CTkFrame(self)
+        self.body.pack(fill="both", expand=True, padx=18, pady=8)
 
-        cont = ctk.CTkFrame(self)
-        cont.pack(fill="both", expand=True, padx=20, pady=10)
-        cont.grid_columnconfigure(0, weight=3)
-        cont.grid_columnconfigure(1, weight=2)
-        cont.grid_rowconfigure(0, weight=1)
+        self.tabs = ctk.CTkTabview(self.body)
+        self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        self.tab_cam = self.tabs.add("1. Camara / LSP demo")
+        self.tab_tts = self.tabs.add("2. Texto a Voz")
+        self.tab_stt = self.tabs.add("3. Voz a Texto")
 
+        self.crear_tab_camara()
+        self.crear_tab_tts()
+        self.crear_tab_stt()
+
+        ctk.CTkLabel(self.body, text="Traducciones guardadas del usuario actual" + (" / todas para admin" if es_admin(master) else ""), font=("Segoe UI", 14, "bold")).pack(pady=(6, 2))
+        self.scroll_hist = ctk.CTkScrollableFrame(self.body, height=150)
+        self.scroll_hist.pack(fill="x", padx=8, pady=(2, 8))
+        self.cargar_historial_visual()
+
+    def crear_tab_camara(self):
+        cont = ctk.CTkFrame(self.tab_cam)
+        cont.pack(fill="both", expand=True, padx=8, pady=8)
         left = ctk.CTkFrame(cont)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=5)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=4)
         right = ctk.CTkFrame(cont)
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0), pady=5)
+        right.pack(side="left", fill="y", padx=(8, 0), pady=4)
 
-        self.video_label = ctk.CTkLabel(left, text="Cámara detenida", width=560, height=360)
-        self.video_label.pack(pady=14, padx=14, fill="both", expand=True)
+        self.video_label = ctk.CTkLabel(left, text="Camara detenida", width=520, height=280)
+        self.video_label.pack(fill="both", expand=True, padx=8, pady=8)
+        btns = ctk.CTkFrame(left)
+        btns.pack(pady=6)
+        ctk.CTkButton(btns, text="Iniciar camara", command=self.iniciar_camara, width=140).pack(side="left", padx=5)
+        ctk.CTkButton(btns, text="Detener camara", command=self.detener_camara, width=140).pack(side="left", padx=5)
 
-        cam_buttons = ctk.CTkFrame(left)
-        cam_buttons.pack(pady=(0, 14))
-        ctk.CTkButton(cam_buttons, text="Iniciar cámara", command=self.iniciar_camara, width=150).pack(side="left", padx=6)
-        ctk.CTkButton(cam_buttons, text="Detener cámara", command=self.detener_camara, width=150).pack(side="left", padx=6)
+        ok, _, gestos = listar_gestos(False, self.master.usuario_actual["id"])
+        valores = [g["nombre_gesto"] for g in gestos] or ["HOLA"]
+        etiqueta(right, "Gesto detectado para simular:")
+        self.gesto_var, _ = option(right, valores, valores[0], width=280)
+        ctk.CTkButton(right, text="Simular reconocimiento", command=self.simular_gesto, width=220).pack(pady=5)
+        etiqueta(right, "Resultado visual:")
+        self.resultado_cam = ctk.CTkTextbox(right, width=300, height=130)
+        self.resultado_cam.pack(padx=8, pady=(0, 6))
+        self.resultado_cam.configure(state="disabled")
+        ctk.CTkButton(right, text="Reproducir resultado", command=self.reproducir_actual, width=220).pack(pady=5)
+        ctk.CTkButton(right, text="Guardar en historial", command=self.guardar_actual, width=220).pack(pady=5)
+        self.msg_cam = ctk.CTkLabel(right, text="", wraplength=300)
+        self.msg_cam.pack(pady=5)
 
-        ok, msg, gestos = listar_gestos_demo()
-        self.gestos = {g["nombre_gesto"]: g for g in gestos} if ok else {}
-        valores = list(self.gestos.keys()) or ["HOLA", "GRACIAS", "AYUDA"]
+    def crear_tab_tts(self):
+        cont = ctk.CTkFrame(self.tab_tts)
+        cont.pack(fill="both", expand=True, padx=8, pady=8)
+        etiqueta(cont, "Texto que se va a reproducir:")
+        self.tts_entry = ctk.CTkTextbox(cont, height=90)
+        self.tts_entry.pack(fill="x", padx=8, pady=(0, 6))
+        etiqueta(cont, "Resultado / mensaje del sistema (solo visualizacion):")
+        self.tts_result = ctk.CTkTextbox(cont, height=90)
+        self.tts_result.pack(fill="x", padx=8, pady=(0, 6))
+        self.tts_result.configure(state="disabled")
+        btns = ctk.CTkFrame(cont)
+        btns.pack(pady=8)
+        ctk.CTkButton(btns, text="Reproducir", command=self.reproducir_tts, width=150).pack(side="left", padx=5)
+        ctk.CTkButton(btns, text="Guardar en historial", command=self.guardar_tts, width=170).pack(side="left", padx=5)
 
-        ctk.CTkLabel(right, text="Simulación de seña detectada", font=("Segoe UI", 16, "bold")).pack(pady=(20, 10))
-        self.gesto_combo = ctk.CTkComboBox(right, values=valores, width=260)
-        self.gesto_combo.set(valores[0])
-        self.gesto_combo.pack(pady=8)
-        ctk.CTkButton(right, text="Simular reconocimiento", command=self.simular_gesto, width=220).pack(pady=8)
-
-        self.resultado_label = ctk.CTkLabel(right, text="Resultado pendiente", wraplength=320, justify="left")
-        self.resultado_label.pack(pady=12, padx=18)
-
-        ctk.CTkButton(right, text="Reconocer voz (STT)", command=self.reconocer_voz, width=220).pack(pady=8)
-        ctk.CTkButton(right, text="Reproducir resultado (TTS)", command=self.reproducir_resultado, width=220).pack(pady=8)
-        ctk.CTkButton(right, text="Guardar en historial", command=self.guardar_actual, width=220).pack(pady=8)
-        self.mensaje_label = ctk.CTkLabel(right, text="", wraplength=320)
-        self.mensaje_label.pack(pady=10)
-        ctk.CTkButton(right, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=220).pack(pady=(10, 20))
+    def crear_tab_stt(self):
+        cont = ctk.CTkFrame(self.tab_stt)
+        cont.pack(fill="both", expand=True, padx=8, pady=8)
+        etiqueta(cont, "Texto reconocido desde voz (solo visualizacion):")
+        self.stt_result = ctk.CTkTextbox(cont, height=120)
+        self.stt_result.pack(fill="x", padx=8, pady=(0, 6))
+        self.stt_result.configure(state="disabled")
+        btns = ctk.CTkFrame(cont)
+        btns.pack(pady=8)
+        ctk.CTkButton(btns, text="Iniciar reconocimiento", command=self.reconocer_voz, width=180).pack(side="left", padx=5)
+        ctk.CTkButton(btns, text="Guardar en historial", command=self.guardar_stt, width=170).pack(side="left", padx=5)
 
     def iniciar_camara(self):
         if self.cap is None:
@@ -511,7 +639,7 @@ class TraduccionFrame(BaseFrame):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        self.video_label.configure(image=None, text="Cámara detenida")
+        self.video_label.configure(image=None, text="Camara detenida")
 
     def update_frame(self):
         if self.cap is not None and self.camera_running:
@@ -519,546 +647,210 @@ class TraduccionFrame(BaseFrame):
             if ret:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(frame)
-                img.thumbnail((560, 360))
-                imgtk = ImageTk.PhotoImage(image=img)
-                self.video_label.configure(image=imgtk, text="")
-                self.video_label.image = imgtk
-            self.after(20, self.update_frame)
+                img.thumbnail((520, 280))
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                self.video_label.configure(image=ctk_img, text="")
+                self.video_label.image = ctk_img
+            self.after(25, self.update_frame)
 
     def simular_gesto(self):
-        nombre = self.gesto_combo.get()
-        ok, msg, gesto = obtener_gesto_demo(nombre)
-        if ok and gesto:
-            self.current_tipo = "LSP a texto (demo)"
-            self.current_original = f"Gesto detectado: {gesto['nombre_gesto']}"
-            self.current_traducido = gesto["texto_traducido"]
-            self.resultado_label.configure(
-                text=f"Tipo: {self.current_tipo}\nOriginal: {self.current_original}\nTraducción: {self.current_traducido}"
-            )
-            self.mensaje_label.configure(text="La seña fue consultada desde PostgreSQL.")
-        else:
-            self.mensaje_label.configure(text=msg)
-
-    def reconocer_voz(self):
-        self.resultado_label.configure(text="Escuchando micrófono...")
-
-        def run():
-            resultado = voice_tools.voz_a_texto()
-            self.current_tipo = "Voz a texto"
-            self.current_original = "Audio capturado desde micrófono"
-            self.current_traducido = resultado.replace("Texto reconocido: ", "")
-            self.after(0, lambda: self.resultado_label.configure(
-                text=f"Tipo: {self.current_tipo}\nOriginal: {self.current_original}\nResultado: {self.current_traducido}"
-            ))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def reproducir_resultado(self):
-        texto = self.current_traducido
-        if not texto:
-            self.mensaje_label.configure(text="Primero simula una seña o reconoce voz.")
+        ok, msg, gesto = obtener_gesto_por_nombre(self.master.usuario_actual["id"], self.gesto_var.get())
+        if not ok or not gesto:
+            self.msg_cam.configure(text=msg)
             return
-        velocidad = self.velocidad_voz_configurada()
-        self.mensaje_label.configure(text=f"Reproduciendo audio en velocidad: {velocidad}...")
+        self.current_tipo = "LSP a texto demo"
+        self.current_original = f"Gesto detectado: {gesto['nombre_gesto']}"
+        self.current_traducido = gesto["texto_traducido"]
+        set_textbox(self.resultado_cam, f"{self.current_original}\nTraduccion: {self.current_traducido}")
+        self.msg_cam.configure(text="Gesto consultado desde los registros del usuario actual.")
 
+    def reproducir_actual(self):
+        if not self.current_traducido:
+            self.msg_cam.configure(text="Primero simula un gesto.")
+            return
+        velocidad = obtener_velocidad_usuario(self.master.usuario_actual["id"])
         def run():
-            msg = voice_tools.texto_a_voz(texto, velocidad=velocidad)
-            self.after(0, lambda: self.mensaje_label.configure(text=msg))
-
+            msg = voice_tools.texto_a_voz(self.current_traducido, velocidad)
+            self.after(0, lambda: self.msg_cam.configure(text=msg))
         threading.Thread(target=run, daemon=True).start()
 
     def guardar_actual(self):
         if not self.current_traducido:
-            self.mensaje_label.configure(text="No hay traducción para guardar.")
+            self.msg_cam.configure(text="No hay traduccion para guardar.")
             return
-        id_usuario = self.master.usuario_actual["id"]
-        ok, msg = guardar_traduccion(id_usuario, self.current_tipo, self.current_original, self.current_traducido)
-        self.mensaje_label.configure(text=msg)
+        ok, msg = guardar_traduccion(self.master.usuario_actual["id"], self.current_tipo, self.current_original, self.current_traducido)
+        self.msg_cam.configure(text=msg)
+        self.cargar_historial_visual()
+
+    def reproducir_tts(self):
+        texto = self.tts_entry.get("1.0", "end").strip()
+        if not texto:
+            set_textbox(self.tts_result, "Ingresa texto para reproducir.")
+            return
+        set_textbox(self.tts_result, "Reproduciendo texto...")
+        velocidad = obtener_velocidad_usuario(self.master.usuario_actual["id"])
+        def run():
+            msg = voice_tools.texto_a_voz(texto, velocidad)
+            self.after(0, lambda: set_textbox(self.tts_result, msg))
+        threading.Thread(target=run, daemon=True).start()
+
+    def guardar_tts(self):
+        texto = self.tts_entry.get("1.0", "end").strip()
+        if not texto:
+            set_textbox(self.tts_result, "No hay texto para guardar.")
+            return
+        ok, msg = guardar_traduccion(self.master.usuario_actual["id"], "Texto a voz", "Texto escrito por usuario", texto)
+        set_textbox(self.tts_result, msg)
+        self.cargar_historial_visual()
+
+    def reconocer_voz(self):
+        set_textbox(self.stt_result, "Escuchando microfono...")
+        def run():
+            resultado = voice_tools.voz_a_texto()
+            self.after(0, lambda: set_textbox(self.stt_result, resultado))
+        threading.Thread(target=run, daemon=True).start()
+
+    def guardar_stt(self):
+        texto = self.stt_result.get("1.0", "end").strip().replace("Texto reconocido: ", "")
+        if not texto or texto.startswith("Escuchando"):
+            set_textbox(self.stt_result, "Primero realiza el reconocimiento de voz.")
+            return
+        ok, msg = guardar_traduccion(self.master.usuario_actual["id"], "Voz a texto", "Audio capturado desde microfono", texto)
+        set_textbox(self.stt_result, msg)
+        self.cargar_historial_visual()
+
+    def cargar_historial_visual(self):
+        for w in self.scroll_hist.winfo_children():
+            w.destroy()
+        ok, msg, filas = listar_traducciones(es_admin(self.master), self.master.usuario_actual["id"])
+        if not ok:
+            ctk.CTkLabel(self.scroll_hist, text=msg).pack(pady=6)
+            return
+        if not filas:
+            ctk.CTkLabel(self.scroll_hist, text="No hay traducciones guardadas.").pack(pady=6)
+            return
+        for f in filas[:10]:
+            texto = f"Usuario: {f['usuario']} | {f['tipo_traduccion']} | {f['texto_traducido']}"
+            ctk.CTkLabel(self.scroll_hist, text=texto, anchor="w", wraplength=980, justify="left").pack(fill="x", padx=8, pady=3)
 
     def destroy(self):
         self.detener_camara()
         super().destroy()
 
 
-class HistorialFrame(BaseFrame):
+# =========================
+# FORMULARIO 5 FRASES
+# =========================
+class FrasesFrame(BaseFrame):
     def __init__(self, master):
         super().__init__(master)
-        if es_admin(master):
-            subtitulo = "Consulta real a PostgreSQL: reproduce o elimina registros guardados"
-        else:
-            subtitulo = "Consulta real a PostgreSQL: reproduce registros. La eliminación queda restringida al administrador."
-        self.titulo("Historial de traducciones", subtitulo)
+        self.id_editando = None
+        self.titulo("Formulario 5: Frases frecuentes", "Cada usuario tiene sus propias frases. El admin ve el propietario de cada registro.")
+        self.nav_bottom()
 
-        top = ctk.CTkFrame(self)
-        top.pack(fill="x", padx=20, pady=8)
-        self.filtro_entry = ctk.CTkEntry(top, placeholder_text="Buscar por texto o tipo", width=340)
-        self.filtro_entry.pack(side="left", padx=8, pady=10)
-        ctk.CTkButton(top, text="Buscar", command=self.cargar_historial, width=120).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Actualizar", command=self.cargar_historial, width=120).pack(side="left", padx=8)
-        ctk.CTkButton(top, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=150).pack(side="right", padx=8)
+        body = ctk.CTkFrame(self)
+        body.pack(fill="both", expand=True, padx=18, pady=8)
+        form = ctk.CTkFrame(body)
+        form.pack(side="left", fill="y", padx=(0, 12), pady=6)
 
-        self.mensaje_label = ctk.CTkLabel(self, text="")
-        self.mensaje_label.pack(pady=2)
+        ok, _, usuarios = listar_usuarios(es_admin(master), master.usuario_actual["id"])
+        self.usuario_map = {f"{u['usuario']} - {u['nombre_completo']}": u["id"] for u in usuarios}
+        if not self.usuario_map:
+            self.usuario_map = {master.usuario_actual["usuario"]: master.usuario_actual["id"]}
 
-        self.scroll = ctk.CTkScrollableFrame(self, width=930, height=470)
-        self.scroll.pack(fill="both", expand=True, padx=20, pady=(4, 18))
-        self.cargar_historial()
+        etiqueta(form, "Usuario propietario:")
+        self.usuario_var, self.usuario_combo = option(
+            form,
+            list(self.usuario_map.keys()),
+            list(self.usuario_map.keys())[0],
+            width=320,
+            command=lambda _: self.cambiar_usuario_propietario(),
+        )
+        etiqueta(form, "Frase frecuente:")
+        self.frase_entry = entrada(form, "Ejemplo: Necesito ayuda", width=320)
+        etiqueta(form, "Categoria:")
+        self.categoria_entry = entrada(form, "Emergencia, Salud, Cortesia...", width=320)
+        etiqueta(form, "Descripcion:")
+        self.descripcion_entry = entrada(form, "Descripcion breve", width=320)
 
-    def cargar_historial(self):
+        self.mensaje = ctk.CTkLabel(form, text="", wraplength=320)
+        self.mensaje.pack(pady=6)
+        ctk.CTkButton(form, text="Guardar frase", command=self.guardar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Limpiar campos", command=self.limpiar, width=180).pack(pady=4)
+        ctk.CTkButton(form, text="Volver al menu principal", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=4)
+
+        self.scroll = ctk.CTkScrollableFrame(body, width=690)
+        self.scroll.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=6)
+        self.cargar()
+
+    def limpiar(self):
+        self.id_editando = None
+        for e in [self.frase_entry, self.categoria_entry, self.descripcion_entry]:
+            limpiar_entry(e)
+        self.mensaje.configure(text="Campos limpios.")
+
+    def cambiar_usuario_propietario(self):
+        self.id_editando = None
+        for e in [self.frase_entry, self.categoria_entry, self.descripcion_entry]:
+            limpiar_entry(e)
+        self.mensaje.configure(text="Mostrando solo las frases del usuario propietario seleccionado.")
+        self.cargar()
+
+    def guardar(self):
+        id_usuario = self.usuario_map.get(self.usuario_var.get(), self.master.usuario_actual["id"])
+        if not es_admin(self.master) and id_usuario != self.master.usuario_actual["id"]:
+            self.mensaje.configure(text="No puedes crear frases para otros usuarios.")
+            return
+        ok, msg = guardar_frase(self.id_editando, id_usuario, self.frase_entry.get(), self.categoria_entry.get(), self.descripcion_entry.get())
+        self.mensaje.configure(text=msg)
+        if ok:
+            self.limpiar()
+            self.cargar()
+
+    def cargar(self):
         for w in self.scroll.winfo_children():
             w.destroy()
-        id_usuario = self.master.usuario_actual["id"]
-        filtro = self.filtro_entry.get() if hasattr(self, "filtro_entry") else ""
-        ok, msg, filas = listar_historial(id_usuario, filtro)
-        self.mensaje_label.configure(text=f"{len(filas)} registro(s) encontrados." if ok else msg)
-
-        if not filas:
-            ctk.CTkLabel(self.scroll, text="No hay traducciones guardadas todavía.").pack(pady=20)
+        ok, msg, frases = listar_frases(es_admin(self.master), self.master.usuario_actual["id"])
+        if not ok:
+            ctk.CTkLabel(self.scroll, text=msg).pack(pady=8)
             return
-
-        for fila in filas:
+        id_filtrado = self.usuario_map.get(self.usuario_var.get(), self.master.usuario_actual["id"])
+        frases = [f for f in frases if f.get("id_usuario") == id_filtrado]
+        if not frases:
+            ctk.CTkLabel(self.scroll, text="No hay frases registradas para el usuario seleccionado.").pack(pady=8)
+            return
+        for f in frases:
             card = ctk.CTkFrame(self.scroll)
-            card.pack(fill="x", padx=8, pady=8)
-            fecha = fila.get("fecha_hora")
-            header = f"ID {fila['id']} | {fila.get('tipo_traduccion')} | {fecha}"
-            ctk.CTkLabel(card, text=header, font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 4))
-            ctk.CTkLabel(card, text=f"Original: {fila.get('texto_original')}", anchor="w", wraplength=850, justify="left").pack(fill="x", padx=12)
-            ctk.CTkLabel(card, text=f"Resultado: {fila.get('texto_traducido')}", anchor="w", wraplength=850, justify="left").pack(fill="x", padx=12, pady=(0, 8))
+            card.pack(fill="x", padx=8, pady=6)
+            header = f"Usuario: {f['usuario']} | Categoria: {f['categoria']}"
+            ctk.CTkLabel(card, text=header, anchor="w", font=("Segoe UI", 13, "bold"), wraplength=640).pack(fill="x", padx=10, pady=(8, 4))
+            ctk.CTkLabel(card, text=f"Frase: {f['frase']}\nDescripcion: {f.get('descripcion') or ''}", anchor="w", wraplength=640, justify="left").pack(fill="x", padx=10, pady=4)
             actions = ctk.CTkFrame(card)
-            actions.pack(fill="x", padx=8, pady=(0, 10))
-            ctk.CTkButton(
-                actions,
-                text="Reproducir",
-                width=115,
-                command=lambda t=fila.get('texto_traducido', ''): self.reproducir(t),
-            ).pack(side="left", padx=5)
-            if es_admin(self.master):
-                ctk.CTkButton(actions, text="Eliminar", width=100, fg_color="#d90429", command=lambda i=fila['id']: self.eliminar(i)).pack(side="left", padx=5)
-            else:
-                ctk.CTkLabel(actions, text="Eliminar: solo administrador", text_color="#9aa4ad").pack(side="left", padx=8)
+            actions.pack(fill="x", padx=10, pady=(0, 8))
+            ctk.CTkButton(actions, text="Cargar para modificar", command=lambda ff=f: self.cargar_form(ff), width=170).pack(side="left", padx=5)
+            ctk.CTkButton(actions, text="Reproducir", command=lambda texto=f['frase']: self.reproducir(texto), width=120).pack(side="left", padx=5)
+
+    def cargar_form(self, f):
+        self.id_editando = f["id"]
+        for label, uid in self.usuario_map.items():
+            if uid == f["id_usuario"]:
+                self.usuario_var.set(label)
+                break
+        self.frase_entry.delete(0, "end")
+        self.frase_entry.insert(0, f["frase"])
+        self.categoria_entry.delete(0, "end")
+        self.categoria_entry.insert(0, f["categoria"])
+        self.descripcion_entry.delete(0, "end")
+        self.descripcion_entry.insert(0, f.get("descripcion") or "")
+        self.mensaje.configure(text="Frase cargada. La modificacion solo afectara al usuario propietario.")
 
     def reproducir(self, texto):
-        if not texto:
-            self.mensaje_label.configure(text="No hay texto para reproducir.")
-            return
-        velocidad = self.velocidad_voz_configurada()
-        self.mensaje_label.configure(text=f"Reproduciendo traducción en velocidad: {velocidad}...")
-
+        velocidad = obtener_velocidad_usuario(self.master.usuario_actual["id"])
+        self.mensaje.configure(text="Reproduciendo frase...")
         def run():
-            msg = voice_tools.texto_a_voz(texto, velocidad=velocidad)
-            self.after(0, lambda: self.mensaje_label.configure(text=msg))
-
+            msg = voice_tools.texto_a_voz(texto, velocidad)
+            self.after(0, lambda: self.mensaje.configure(text=msg))
         threading.Thread(target=run, daemon=True).start()
-
-    def eliminar(self, id_historial):
-        if not es_admin(self.master):
-            self.mensaje_label.configure(text="No tienes permiso para eliminar registros.")
-            return
-        ok, msg = eliminar_historial(self.master.usuario_actual["id"], id_historial)
-        self.mensaje_label.configure(text=msg)
-        self.cargar_historial()
-
-
-class AdminPanelFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        if not es_admin(master):
-            self.titulo("Acceso restringido", "Esta sección solo está disponible para administradores.")
-            ctk.CTkButton(self, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=20)
-            return
-
-        self.titulo("Panel Administrador", "Funciones exclusivas del rol administrador")
-        ctk.CTkLabel(
-            self,
-            text="Desde aquí se realizan modificaciones generales del sistema. Los usuarios normales no pueden acceder a esta pantalla.",
-            wraplength=760,
-            justify="center",
-        ).pack(pady=(0, 18))
-
-        cont = ctk.CTkFrame(self)
-        cont.pack(padx=40, pady=18, fill="both", expand=True)
-        cont.grid_columnconfigure((0, 1), weight=1)
-
-        card1 = ctk.CTkFrame(cont)
-        card1.grid(row=0, column=0, padx=16, pady=16, sticky="nsew")
-        ctk.CTkLabel(card1, text="Gestión de usuarios", font=("Segoe UI", 18, "bold")).pack(pady=(28, 8))
-        ctk.CTkLabel(card1, text="Crear usuarios, activar/desactivar cuentas y cambiar roles.", wraplength=330).pack(pady=8, padx=18)
-        ctk.CTkButton(card1, text="Abrir", command=lambda: master.show_frame(AdminUsuariosFrame), width=160).pack(pady=(14, 28))
-
-        card2 = ctk.CTkFrame(cont)
-        card2.grid(row=0, column=1, padx=16, pady=16, sticky="nsew")
-        ctk.CTkLabel(card2, text="Gestión de gestos demo", font=("Segoe UI", 18, "bold")).pack(pady=(28, 8))
-        ctk.CTkLabel(card2, text="Registrar, editar o desactivar gestos de prueba usados en la simulación.", wraplength=330).pack(pady=8, padx=18)
-        ctk.CTkButton(card2, text="Abrir", command=lambda: master.show_frame(AdminGestosFrame), width=160).pack(pady=(14, 28))
-
-        nav = ctk.CTkFrame(self)
-        nav.pack(pady=14)
-        ctk.CTkButton(nav, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=160).pack(side="left", padx=8)
-        ctk.CTkButton(nav, text="Cerrar sesión", command=master.cerrar_sesion, width=160).pack(side="left", padx=8)
-        ctk.CTkButton(nav, text="Salir", command=master.quit, fg_color="#d90429", width=140).pack(side="left", padx=8)
-
-
-class AdminUsuariosFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        if not es_admin(master):
-            self.titulo("Acceso restringido", "No tienes permisos administrativos.")
-            ctk.CTkButton(self, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=20)
-            return
-
-        self.titulo("Administración de usuarios", "Crear cuentas, activar/desactivar usuarios y asignar roles")
-        top = ctk.CTkFrame(self)
-        top.pack(fill="x", padx=24, pady=8)
-
-        self.usuario_entry = ctk.CTkEntry(top, placeholder_text="Usuario", width=150)
-        self.usuario_entry.pack(side="left", padx=5, pady=10)
-        self.nombre_entry = ctk.CTkEntry(top, placeholder_text="Nombre completo", width=190)
-        self.nombre_entry.pack(side="left", padx=5, pady=10)
-        self.password_entry = ctk.CTkEntry(top, placeholder_text="Contraseña", show="*", width=150)
-        self.password_entry.pack(side="left", padx=5, pady=10)
-        self.rol_combo = ctk.CTkComboBox(top, values=["usuario", "admin"], width=110)
-        self.rol_combo.set("usuario")
-        self.rol_combo.pack(side="left", padx=5, pady=10)
-        self.crear_admin_btn = ctk.CTkButton(top, text="Crear", command=self.crear_desde_admin, width=90)
-        self.crear_admin_btn.pack(side="left", padx=5)
-        ctk.CTkButton(top, text="Cerrar sesión", command=master.cerrar_sesion, width=120).pack(side="right", padx=5)
-        ctk.CTkButton(top, text="Volver", command=lambda: master.show_frame(AdminPanelFrame), width=90).pack(side="right", padx=5)
-
-        self.mensaje_label = ctk.CTkLabel(self, text="", wraplength=850)
-        self.mensaje_label.pack(pady=4)
-        self.scroll = ctk.CTkScrollableFrame(self, width=940, height=430)
-        self.scroll.pack(fill="both", expand=True, padx=24, pady=(4, 8))
-        bottom = ctk.CTkFrame(self)
-        bottom.pack(pady=(0, 14))
-        ctk.CTkButton(bottom, text="Volver al panel", command=lambda: master.show_frame(AdminPanelFrame), width=150).pack(side="left", padx=6)
-        ctk.CTkButton(bottom, text="Cerrar sesión", command=master.cerrar_sesion, width=150).pack(side="left", padx=6)
-        self.cargar_usuarios()
-
-    def crear_desde_admin(self):
-        self.crear_admin_btn.configure(state="disabled", text="Creando...")
-        ok, msg = crear_usuario(
-            self.usuario_entry.get(),
-            self.password_entry.get(),
-            self.nombre_entry.get(),
-            self.rol_combo.get(),
-        )
-        self.mensaje_label.configure(text=msg)
-        if ok:
-            self.usuario_entry.delete(0, "end")
-            self.nombre_entry.delete(0, "end")
-            self.password_entry.delete(0, "end")
-            self.rol_combo.set("usuario")
-            self.cargar_usuarios()
-        self.crear_admin_btn.configure(state="normal", text="Crear")
-
-    def cargar_usuarios(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-        ok, msg, usuarios = admin_listar_usuarios()
-        self.mensaje_label.configure(text=f"{len(usuarios)} usuario(s) encontrados." if ok else msg)
-        for u in usuarios:
-            card = ctk.CTkFrame(self.scroll)
-            card.pack(fill="x", padx=8, pady=7)
-            estado = "activo" if u.get("activo") else "inactivo"
-            texto = f"ID {u['id']} | {u['usuario']} | Rol: {u.get('rol')} | Estado: {estado}"
-            ctk.CTkLabel(card, text=texto, font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-            ctk.CTkLabel(card, text=f"Nombre: {u.get('nombre_completo') or ''} | Último login: {u.get('ultimo_login')}", anchor="w").pack(fill="x", padx=12, pady=(0, 8))
-            actions = ctk.CTkFrame(card)
-            actions.pack(fill="x", padx=8, pady=(0, 10))
-            nuevo_rol = "admin" if (u.get("rol") or "usuario") == "usuario" else "usuario"
-            ctk.CTkButton(actions, text=f"Cambiar a {nuevo_rol}", width=125, command=lambda i=u['id'], r=nuevo_rol: self.cambiar_rol(i, r)).pack(side="left", padx=5)
-            nuevo_estado = not bool(u.get("activo"))
-            texto_estado = "Activar" if nuevo_estado else "Desactivar"
-            ctk.CTkButton(actions, text=texto_estado, width=110, fg_color="#d90429" if not nuevo_estado else None, command=lambda i=u['id'], a=nuevo_estado: self.cambiar_estado(i, a)).pack(side="left", padx=5)
-
-    def cambiar_rol(self, id_usuario, nuevo_rol):
-        ok, msg = admin_cambiar_rol(id_usuario, nuevo_rol)
-        self.mensaje_label.configure(text=msg)
-        self.cargar_usuarios()
-
-    def cambiar_estado(self, id_usuario, activo):
-        if id_usuario == self.master.usuario_actual.get("id") and not activo:
-            self.mensaje_label.configure(text="No puedes desactivar tu propia cuenta durante la sesión.")
-            return
-        ok, msg = admin_cambiar_estado_usuario(id_usuario, activo)
-        self.mensaje_label.configure(text=msg)
-        self.cargar_usuarios()
-
-
-class AdminGestosFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        if not es_admin(master):
-            self.titulo("Acceso restringido", "No tienes permisos administrativos.")
-            ctk.CTkButton(self, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=20)
-            return
-
-        self.titulo("Administración de gestos demo", "Modificar gestos de prueba usados en la pantalla de traducción")
-        top = ctk.CTkFrame(self)
-        top.pack(fill="x", padx=24, pady=8)
-
-        self.nombre_entry = ctk.CTkEntry(top, placeholder_text="Gesto: HOLA", width=130)
-        self.nombre_entry.pack(side="left", padx=5, pady=10)
-        self.texto_entry = ctk.CTkEntry(top, placeholder_text="Texto traducido", width=250)
-        self.texto_entry.pack(side="left", padx=5, pady=10)
-        self.categoria_entry = ctk.CTkEntry(top, placeholder_text="Categoría", width=130)
-        self.categoria_entry.pack(side="left", padx=5, pady=10)
-        self.descripcion_entry = ctk.CTkEntry(top, placeholder_text="Descripción", width=210)
-        self.descripcion_entry.pack(side="left", padx=5, pady=10)
-        ctk.CTkButton(top, text="Guardar", command=self.guardar_gesto, width=95).pack(side="left", padx=5)
-        ctk.CTkButton(top, text="Cerrar sesión", command=master.cerrar_sesion, width=120).pack(side="right", padx=5)
-        ctk.CTkButton(top, text="Volver", command=lambda: master.show_frame(AdminPanelFrame), width=90).pack(side="right", padx=5)
-
-        self.mensaje_label = ctk.CTkLabel(self, text="", wraplength=850)
-        self.mensaje_label.pack(pady=4)
-        self.scroll = ctk.CTkScrollableFrame(self, width=940, height=430)
-        self.scroll.pack(fill="both", expand=True, padx=24, pady=(4, 8))
-        bottom = ctk.CTkFrame(self)
-        bottom.pack(pady=(0, 14))
-        ctk.CTkButton(bottom, text="Volver al panel", command=lambda: master.show_frame(AdminPanelFrame), width=150).pack(side="left", padx=6)
-        ctk.CTkButton(bottom, text="Cerrar sesión", command=master.cerrar_sesion, width=150).pack(side="left", padx=6)
-        self.cargar_gestos()
-
-    def guardar_gesto(self):
-        ok, msg = admin_guardar_gesto(
-            self.nombre_entry.get(),
-            self.texto_entry.get(),
-            self.categoria_entry.get(),
-            self.descripcion_entry.get(),
-        )
-        self.mensaje_label.configure(text=msg)
-        if ok:
-            self.nombre_entry.delete(0, "end")
-            self.texto_entry.delete(0, "end")
-            self.categoria_entry.delete(0, "end")
-            self.descripcion_entry.delete(0, "end")
-            self.cargar_gestos()
-
-    def cargar_gestos(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-        ok, msg, gestos = admin_listar_gestos_todos()
-        self.mensaje_label.configure(text=f"{len(gestos)} gesto(s) registrados." if ok else msg)
-        for g in gestos:
-            card = ctk.CTkFrame(self.scroll)
-            card.pack(fill="x", padx=8, pady=7)
-            estado = "activo" if g.get("activo") else "inactivo"
-            ctk.CTkLabel(card, text=f"ID {g['id']} | {g.get('nombre_gesto')} | {g.get('categoria')} | Estado: {estado}", font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x", padx=12, pady=(10, 2))
-            ctk.CTkLabel(card, text=f"Texto: {g.get('texto_traducido')}", anchor="w", wraplength=850, justify="left").pack(fill="x", padx=12)
-            ctk.CTkLabel(card, text=f"Descripción: {g.get('descripcion') or ''}", anchor="w", wraplength=850, justify="left").pack(fill="x", padx=12, pady=(0, 8))
-            actions = ctk.CTkFrame(card)
-            actions.pack(fill="x", padx=8, pady=(0, 10))
-            nuevo_estado = not bool(g.get("activo"))
-            texto_estado = "Activar" if nuevo_estado else "Desactivar"
-            ctk.CTkButton(actions, text=texto_estado, width=110, fg_color="#d90429" if not nuevo_estado else None, command=lambda i=g['id'], a=nuevo_estado: self.cambiar_estado(i, a)).pack(side="left", padx=5)
-            ctk.CTkButton(actions, text="Cargar en formulario", width=150, command=lambda gg=g: self.cargar_en_formulario(gg)).pack(side="left", padx=5)
-
-    def cargar_en_formulario(self, gesto):
-        self.nombre_entry.delete(0, "end")
-        self.nombre_entry.insert(0, gesto.get("nombre_gesto") or "")
-        self.texto_entry.delete(0, "end")
-        self.texto_entry.insert(0, gesto.get("texto_traducido") or "")
-        self.categoria_entry.delete(0, "end")
-        self.categoria_entry.insert(0, gesto.get("categoria") or "")
-        self.descripcion_entry.delete(0, "end")
-        self.descripcion_entry.insert(0, gesto.get("descripcion") or "")
-        self.mensaje_label.configure(text="Gesto cargado. Modifica los campos y presiona Guardar.")
-
-    def cambiar_estado(self, id_gesto, activo):
-        ok, msg = admin_cambiar_estado_gesto(id_gesto, activo)
-        self.mensaje_label.configure(text=msg)
-        self.cargar_gestos()
-
-
-class ConfiguracionFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        self.titulo("Configuración y Perfil", "Actualiza los datos visibles, el tamaño de texto y la velocidad real de voz")
-        id_usuario = master.usuario_actual["id"]
-        _, _, usuario = obtener_usuario(id_usuario)
-        _, _, config = obtener_configuracion(id_usuario)
-        usuario = usuario or master.usuario_actual
-        self.config = config or {}
-
-        cont = ctk.CTkScrollableFrame(self, width=900, height=500)
-        cont.pack(padx=35, pady=12, fill="both", expand=True)
-        cont.grid_columnconfigure(0, weight=1)
-        cont.grid_columnconfigure(1, weight=1)
-
-        header = ctk.CTkFrame(cont)
-        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 16))
-        ctk.CTkLabel(
-            header,
-            text=f"Usuario: {usuario.get('usuario')}",
-            font=("Segoe UI", 16, "bold")
-        ).pack(pady=(12, 4))
-        ctk.CTkLabel(
-            header,
-            text="Esta pantalla sí modifica el comportamiento de la aplicación: el tamaño de texto cambia la escala visual y la velocidad de voz afecta la reproducción TTS.",
-            wraplength=760,
-            justify="center"
-        ).pack(pady=(0, 12))
-
-        def crear_fila(row, titulo, descripcion, opciones_texto=None):
-            info = ctk.CTkFrame(cont)
-            info.grid(row=row, column=0, sticky="nsew", padx=(12, 8), pady=8)
-            ctk.CTkLabel(
-                info,
-                text=titulo,
-                font=("Segoe UI", 14, "bold"),
-                anchor="w"
-            ).pack(fill="x", padx=12, pady=(10, 2))
-            ctk.CTkLabel(
-                info,
-                text=descripcion,
-                wraplength=340,
-                justify="left",
-                anchor="w"
-            ).pack(fill="x", padx=12, pady=(0, 10))
-
-            campo = ctk.CTkFrame(cont)
-            campo.grid(row=row, column=1, sticky="nsew", padx=(8, 12), pady=8)
-            if opciones_texto:
-                ctk.CTkLabel(
-                    campo,
-                    text=opciones_texto,
-                    font=("Segoe UI", 12),
-                    wraplength=360,
-                    justify="left",
-                    anchor="w"
-                ).pack(fill="x", padx=16, pady=(12, 4))
-            return campo
-
-        campo_nombre = crear_fila(
-            1,
-            "Nombre completo",
-            "Dato visible en el perfil y en el menú principal. Sirve para identificar al usuario activo.",
-        )
-        self.nombre_entry = ctk.CTkEntry(campo_nombre, width=360, placeholder_text="Nombre completo")
-        self.nombre_entry.insert(0, usuario.get("nombre_completo") or "")
-        self.nombre_entry.pack(fill="x", padx=16, pady=(14, 16))
-
-        campo_tema = crear_fila(
-            2,
-            "Tema visual",
-            "Define la apariencia de la interfaz. Se aplica al guardar.",
-            "Opciones: dark = fondo oscuro | light = fondo claro",
-        )
-        self.tema_var = ctk.StringVar(value=self.config.get("tema", "dark"))
-        self.tema_menu = ctk.CTkOptionMenu(campo_tema, values=["dark", "light"], variable=self.tema_var, width=360)
-        self.tema_menu.pack(fill="x", padx=16, pady=(4, 16))
-
-        campo_tamano = crear_fila(
-            3,
-            "Tamaño de texto",
-            "Ahora sí cambia la escala visual real de la aplicación. Al guardar, los formularios se verán más pequeños o más grandes.",
-            "Opciones: pequeño = escala 90% | normal = escala 100% | grande = escala 118%",
-        )
-        self.tamano_var = ctk.StringVar(value=self.config.get("tamano_texto", "normal"))
-        self.tamano_menu = ctk.CTkOptionMenu(campo_tamano, values=["pequeño", "normal", "grande"], variable=self.tamano_var, width=360)
-        self.tamano_menu.pack(fill="x", padx=16, pady=(4, 16))
-
-        campo_velocidad = crear_fila(
-            4,
-            "Velocidad de voz",
-            "Ahora sí afecta la reproducción del módulo Texto a Voz. Se usa en la pantalla de traducción y en Texto a Voz.",
-            "Opciones: lenta | normal | rápida",
-        )
-        self.velocidad_var = ctk.StringVar(value=self.config.get("velocidad_voz", "normal"))
-        self.velocidad_menu = ctk.CTkOptionMenu(campo_velocidad, values=["lenta", "normal", "rápida"], variable=self.velocidad_var, width=360)
-        self.velocidad_menu.pack(fill="x", padx=16, pady=(4, 16))
-
-        self.mensaje_label = ctk.CTkLabel(cont, text="", wraplength=760)
-        self.mensaje_label.grid(row=5, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="ew")
-
-        buttons = ctk.CTkFrame(cont)
-        buttons.grid(row=6, column=0, columnspan=2, pady=(8, 22))
-        ctk.CTkButton(buttons, text="Guardar configuración", command=self.guardar, width=190).pack(side="left", padx=8)
-        ctk.CTkButton(buttons, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=190).pack(side="left", padx=8)
-
-    def guardar(self):
-        id_usuario = self.master.usuario_actual["id"]
-        nombre = self.nombre_entry.get()
-        tema = self.tema_var.get()
-        tamano_texto = self.tamano_var.get()
-        velocidad_voz = self.velocidad_var.get()
-
-        # Se mantienen valores internos por compatibilidad con la tabla, pero ya no se muestran en pantalla.
-        idioma = self.config.get("idioma", "es")
-        notificaciones = bool(self.config.get("notificaciones", True))
-
-        ok1, msg1 = actualizar_perfil(id_usuario, nombre)
-        ok2, msg2 = guardar_configuracion(id_usuario, tema, tamano_texto, velocidad_voz, idioma, notificaciones)
-        self.master.aplicar_preferencias_visuales(tema, tamano_texto)
-        self.master.velocidad_voz_actual = velocidad_voz
-        if ok1 and ok2:
-            self.master.usuario_actual["nombre_completo"] = nombre
-            self.config["tema"] = tema
-            self.config["tamano_texto"] = tamano_texto
-            self.config["velocidad_voz"] = velocidad_voz
-            self.mensaje_label.configure(text=f"Configuración guardada. Tamaño: {tamano_texto}. Voz: {velocidad_voz}.")
-        else:
-            self.mensaje_label.configure(text=msg1 + chr(10) + msg2)
-
-
-
-class TextoAVozFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        velocidad = self.velocidad_voz_configurada()
-        self.titulo("Texto a Voz", f"Módulo TTS del prototipo | Velocidad configurada: {velocidad}")
-        self.entry = ctk.CTkEntry(self, width=620, placeholder_text="Ingresa el texto que quieres escuchar")
-        self.entry.pack(pady=16)
-        self.output = ctk.CTkLabel(self, text="", width=620, wraplength=620)
-        self.output.pack(pady=8)
-        ctk.CTkButton(self, text="Reproducir", command=self.reproducir, width=180).pack(pady=8)
-        ctk.CTkButton(self, text="Guardar como traducción", command=self.guardar, width=180).pack(pady=8)
-        ctk.CTkButton(self, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=180).pack(pady=8)
-
-    def reproducir(self):
-        text = self.entry.get()
-        velocidad = self.velocidad_voz_configurada()
-        self.output.configure(text=f"Reproduciendo en velocidad: {velocidad}...")
-
-        def run():
-            resultado = voice_tools.texto_a_voz(text, velocidad=velocidad)
-            self.after(0, lambda: self.output.configure(text=resultado))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def guardar(self):
-        text = self.entry.get()
-        ok, msg = guardar_traduccion(self.master.usuario_actual["id"], "Texto a voz", "Texto escrito por usuario", text)
-        self.output.configure(text=msg)
-
-
-class VozATextoFrame(BaseFrame):
-    def __init__(self, master):
-        super().__init__(master)
-        self.ultimo_texto = ""
-        self.titulo("Voz a Texto", "Módulo STT del prototipo")
-        self.output = ctk.CTkLabel(self, text="Presiona el botón y habla.", width=620, wraplength=620)
-        self.output.pack(pady=24)
-        ctk.CTkButton(self, text="Iniciar reconocimiento", command=self.reconocer, width=220).pack(pady=8)
-        ctk.CTkButton(self, text="Guardar en historial", command=self.guardar, width=220).pack(pady=8)
-        ctk.CTkButton(self, text="Volver al menú", command=lambda: master.show_frame(MenuFrame), width=220).pack(pady=8)
-
-    def reconocer(self):
-        self.output.configure(text="Habla ahora...")
-
-        def run():
-            resultado = voice_tools.voz_a_texto()
-            self.ultimo_texto = resultado.replace("Texto reconocido: ", "")
-            self.after(0, lambda: self.output.configure(text=resultado))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def guardar(self):
-        if not self.ultimo_texto:
-            self.output.configure(text="Primero debes reconocer voz.")
-            return
-        ok, msg = guardar_traduccion(self.master.usuario_actual["id"], "Voz a texto", "Audio capturado desde micrófono", self.ultimo_texto)
-        self.output.configure(text=msg)
 
 
 if __name__ == "__main__":
